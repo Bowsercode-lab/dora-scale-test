@@ -1,0 +1,133 @@
+# Lab stand-in for a deploy "cell" engine: one call per (environment, region) cell.
+# Structure mirrors the shape we observed (route -> approval gate -> typed deploys -> Summary -> Notify Slack);
+# it is our own minimal rebuild, not customer code. The report-dora job at the end is what the workbook adds.
+name: Deploy cell
+on:
+  workflow_call:
+    inputs:
+      deploy_matrix: { type: string, required: true }   # JSON array of entries
+      environment:   { type: string, required: false, default: "" }
+      dry_run:       { type: boolean, required: false, default: false }
+      destroy:       { type: boolean, required: false, default: false }
+      caller:        { type: string, required: false, default: "manual" }
+permissions:
+  contents: read
+jobs:
+  route:
+    name: Route
+    runs-on: ubuntu-latest
+    outputs:
+      full_matrix: ${{ steps.split.outputs.full_matrix }}
+      gate_matrix: ${{ steps.split.outputs.gate_matrix }}
+      has_k8s: ${{ steps.split.outputs.has_k8s }}
+      has_sam: ${{ steps.split.outputs.has_sam }}
+      k8s_matrix: ${{ steps.split.outputs.k8s_matrix }}
+      sam_matrix: ${{ steps.split.outputs.sam_matrix }}
+    steps:
+      - id: split
+        env: { M: "${{ inputs.deploy_matrix }}" }
+        run: |
+          {
+            echo "full_matrix=$(jq -c . <<<"$M")"
+            echo "gate_matrix=$(jq -c '[.[] | select(.base_environment == "prod")] | if length == 0 then [] else [{approval_environment: .[0].approval_environment, base_environment: "prod", projects: map(.project)}] end' <<<"$M")"
+            echo "k8s_matrix=$(jq -c '[.[] | select(.project_type == "k8s")]' <<<"$M")"
+            echo "sam_matrix=$(jq -c '[.[] | select(.project_type == "sam")]' <<<"$M")"
+            echo "has_k8s=$(jq -r 'any(.[]; .project_type == "k8s")' <<<"$M")"
+            echo "has_sam=$(jq -r 'any(.[]; .project_type == "sam")' <<<"$M")"
+          } >> "$GITHUB_OUTPUT"
+
+  gate:
+    name: "Approval (${{ matrix.approval_environment || matrix.base_environment }})"
+    needs: [route]
+    if: always() && needs.route.result == 'success' && needs.route.outputs.gate_matrix != '[]'
+    runs-on: ubuntu-latest
+    environment: ${{ (inputs.dry_run != true && inputs.destroy != true && inputs.caller != 'pr' && inputs.caller != 'cdlx-ci') && (matrix.approval_environment || matrix.base_environment) || '' }}
+    strategy:
+      matrix:
+        include: ${{ fromJson(needs.route.outputs.gate_matrix) }}
+    steps:
+      - run: echo "Gate passed for ${{ matrix.approval_environment || matrix.base_environment }}"
+
+  deploy-k8s:
+    name: Deploy K8s
+    needs: [route, gate]
+    if: always() && needs.route.result == 'success' && needs.route.outputs.has_k8s == 'true' && (needs.gate.result == 'success' || needs.gate.result == 'skipped')
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include: ${{ fromJson(needs.route.outputs.k8s_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ matrix.git_ref || '' }}" }
+      - name: Deploy (stand-in)
+        run: |
+          echo "k8s ${{ matrix.project }} ${{ matrix.tag }} -> ${{ matrix.environment }} ${{ matrix.region }} (caller ${{ inputs.caller }}, dry_run ${{ inputs.dry_run }})"
+          if [[ "${{ inputs.caller }}" == "cdlx-ci" || "${{ inputs.dry_run }}" == "true" ]]; then echo "plan only"; exit 0; fi
+          sleep $((RANDOM % 15 + 5))
+          if [ -f "${{ matrix.project_path }}/FAIL_${{ matrix.region }}" ]; then echo "simulated failure in ${{ matrix.region }}"; exit 1; fi
+
+  deploy-sam:
+    name: Deploy SAM / Serverless
+    needs: [route, gate]
+    if: always() && needs.route.result == 'success' && needs.route.outputs.has_sam == 'true' && (needs.gate.result == 'success' || needs.gate.result == 'skipped')
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include: ${{ fromJson(needs.route.outputs.sam_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ matrix.git_ref || '' }}" }
+      - name: Deploy (stand-in)
+        run: |
+          echo "sam ${{ matrix.project }} ${{ matrix.tag }} -> ${{ matrix.environment }} ${{ matrix.region }}"
+          if [[ "${{ inputs.caller }}" == "cdlx-ci" || "${{ inputs.dry_run }}" == "true" ]]; then echo "plan only"; exit 0; fi
+          sleep $((RANDOM % 15 + 5))
+          if [ -f "${{ matrix.project_path }}/FAIL_${{ matrix.region }}" ]; then echo "simulated failure in ${{ matrix.region }}"; exit 1; fi
+
+  aggregate:
+    name: Summary
+    needs: [route, deploy-k8s, deploy-sam]
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      all_succeeded: ${{ steps.result.outputs.success }}
+    steps:
+      - id: result
+        env: { K8S: "${{ needs.deploy-k8s.result }}", SAM: "${{ needs.deploy-sam.result }}" }
+        run: |
+          ALL_OK=true; ANY=false
+          for R in "$K8S" "$SAM"; do
+            if [ "$R" = success ]; then ANY=true; elif [ "$R" != skipped ]; then ALL_OK=false; fi
+          done
+          if [ "$ALL_OK" = true ] && [ "$ANY" = true ]; then echo "success=true" >> "$GITHUB_OUTPUT"; else echo "success=false" >> "$GITHUB_OUTPUT"; fi
+
+  notify-deploy:
+    name: Notify Slack
+    needs: [route, aggregate]
+    if: always() && needs.route.result == 'success' && needs.aggregate.result != 'skipped' && inputs.dry_run != true && inputs.destroy != true
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Slack stand-in - all_succeeded=${{ needs.aggregate.outputs.all_succeeded }}"
+
+  # ---- Added by the workbook (Step 2) ----
+  report-dora:
+    name: Report deploy to Coralogix
+    needs: [route, gate, aggregate]
+    if: >-
+      always() && needs.route.result == 'success' && needs.aggregate.result != 'skipped' &&
+      (needs.gate.result == 'success' || needs.gate.result == 'skipped') &&
+      inputs.dry_run != true && inputs.destroy != true && inputs.caller != 'pr' && inputs.caller != 'cdlx-ci'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    permissions: { contents: write, pull-requests: read, actions: read }
+    steps:
+      - uses: actions/checkout@v4
+        with: { sparse-checkout: .github/actions/report-deploy }
+      - uses: ./.github/actions/report-deploy
+        with:
+          deploy-matrix: ${{ needs.route.outputs.full_matrix }}
+          environments: prod
+          status: ${{ needs.aggregate.outputs.all_succeeded == 'true' && 'success' || 'failure' }}
+          coralogix-api-key: ${{ secrets.CORALOGIX_SEND_YOUR_DATA_KEY }}
+          coralogix-ops-events-key: ${{ secrets.CORALOGIX_OPS_EVENTS_KEY }}
+          github-token: ${{ github.token }}

@@ -1,0 +1,55 @@
+# Lab stand-in for the manual dispatcher: deploy an existing release tag (possibly older) to chosen regions.
+# A single cell call may carry several entries (the low-level dispatch case), so the report must handle that too.
+name: Deploy
+run-name: "Deploy ${{ inputs.project }}@v${{ inputs.version }} → prod (${{ inputs.regions }})"
+on:
+  workflow_dispatch:
+    inputs:
+      project: { description: "Project path", required: true, default: "services/aura-api" }
+      version: { description: "Existing release version to deploy, e.g. 1.1.0", required: true }
+      regions: { description: "Comma-separated regions", required: false, default: "us-east-1" }
+      single_cell: { description: "Send all regions in ONE cell call (multi-entry matrix)", type: boolean, default: false }
+      dry_run: { type: boolean, default: false }
+      destroy: { type: boolean, default: false }
+      approval_environment: { required: false, default: "prod" }
+permissions:
+  contents: read
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      cells: ${{ steps.m.outputs.cells }}
+    steps:
+      - id: m
+        env: { P: "${{ inputs.project }}", V: "${{ inputs.version }}", R: "${{ inputs.regions }}", ONE: "${{ inputs.single_cell }}", A: "${{ inputs.approval_environment }}" }
+        run: |
+          name="$(basename "$P")"; type=k8s; team=dd-advertiser_backend; [[ "$P" == apps/* ]] && { type=sam; team=dd-ads_manager; }
+          entries="$(jq -cn --arg n "$name" --arg p "$P" --arg t "$type" --arg team "$team" --arg v "$V" --arg R "$R" --arg a "$A" \
+            '[$R | split(",")[] | {project: $n, project_path: $p, project_type: $t, environment: "prod", base_environment: "prod",
+              region: ., approval_environment: $a, tag: $v, git_ref: ($n + "@v" + $v), dd_team: $team}]')"
+          if [[ "$ONE" == true ]]; then
+            cells="$(jq -c '[{name: "deploy - all regions", region: "multi", deploy_matrix: (. | tojson)}]' <<<"$entries")"
+          else
+            cells="$(jq -c '[.[] | {name: ("deploy - " + .project + " (prod, " + .region + ")"), region: .region, deploy_matrix: ([.] | tojson)}]' <<<"$entries")"
+          fi
+          echo "cells=$cells" >> "$GITHUB_OUTPUT"
+
+  deploy-prod:
+    name: ${{ matrix.name }}
+    needs: [plan]
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.cells) }}
+    concurrency:
+      group: main-${{ inputs.project }}-prod-${{ matrix.region }}
+      cancel-in-progress: false
+    permissions: { contents: write, pull-requests: read, actions: read }
+    uses: ./.github/workflows/cell.yml
+    with:
+      deploy_matrix: ${{ matrix.deploy_matrix }}
+      environment: prod
+      dry_run: ${{ inputs.dry_run }}
+      destroy: ${{ inputs.destroy }}
+      caller: manual
+    secrets: inherit

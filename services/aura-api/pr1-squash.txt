@@ -1,2 +1,0 @@
-pr1-squash 1
-pr1-squash 2

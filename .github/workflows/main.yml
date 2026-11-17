@@ -1,0 +1,65 @@
+# Lab stand-in for the post-merge deploy: detect changed projects, then one cell call per (project, env, region).
+name: Main
+run-name: "Deploy: ${{ github.event.head_commit.message || 'manual' }}"
+on:
+  push:
+    branches: [main]
+    paths: ["services/**", "apps/**"]
+  workflow_dispatch:
+    inputs:
+      force_projects: { description: "Comma-separated project paths", required: false, default: "" }
+      approval_environment: { description: "Approval environment (prod = no reviewers, prod-gated = reviewer)", required: false, default: "prod" }
+permissions:
+  contents: read
+jobs:
+  plan:
+    name: Plan deploy cells
+    runs-on: ubuntu-latest
+    outputs:
+      prod_matrix: ${{ steps.p.outputs.prod_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 2 }
+      - id: p
+        env:
+          FORCE: ${{ inputs.force_projects }}
+          APPROVAL: ${{ inputs.approval_environment || 'prod' }}
+        run: |
+          if [[ -n "$FORCE" ]]; then
+            PATHS="$(tr ',' '\n' <<<"$FORCE")"
+          else
+            PATHS="$(git diff --name-only HEAD~1 HEAD | grep -E '^(services|apps)/[^/]+/' | cut -d/ -f1-2 | sort -u || true)"
+          fi
+          ENTRIES='[]'
+          for p in $PATHS; do
+            [[ -d "$p" ]] || continue
+            name="$(basename "$p")"; type=k8s; [[ "$p" == apps/* ]] && type=sam
+            team=dd-advertiser_backend; [[ "$p" == apps/* ]] && team=dd-ads_manager
+            for region in us-east-1 eu-west-1; do
+              ENTRIES="$(jq -c --arg n "$name" --arg p "$p" --arg t "$type" --arg team "$team" --arg r "$region" --arg a "$APPROVAL" --arg v "$(cat "$p/VERSION")-rc.${{ github.run_number }}" \
+                '. + [{name: ("deploy - " + $n + "[" + $t + "] (prod, " + $r + ")"), project: $n, project_path: $p, project_type: $t,
+                       environment: "prod", base_environment: "prod", region: $r, approval_environment: $a,
+                       tag: $v, git_ref: "", dd_team: $team}]' <<<"$ENTRIES")"
+            done
+          done
+          echo "prod_matrix=$ENTRIES" >> "$GITHUB_OUTPUT"
+          jq . <<<"$ENTRIES"
+
+  deploy-prod:
+    name: ${{ matrix.name }}
+    needs: [plan]
+    if: needs.plan.outputs.prod_matrix != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.prod_matrix) }}
+    concurrency:
+      group: main-${{ matrix.project }}-${{ matrix.environment }}-${{ matrix.region }}
+      cancel-in-progress: false
+    permissions: { contents: write, pull-requests: read, actions: read }
+    uses: ./.github/workflows/cell.yml
+    with:
+      deploy_matrix: ${{ toJson(fromJson(format('[{0}]', toJson(matrix)))) }}
+      environment: ${{ matrix.environment }}
+      caller: main
+    secrets: inherit

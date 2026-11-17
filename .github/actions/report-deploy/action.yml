@@ -1,15 +1,20 @@
 name: Report deployment to Coralogix
 description: >
   Sends one DORA deployment record (and one change record per pull request in the deploy) to
-  Coralogix. Run it as the last step of every production deploy job. It is the only deploy
-  source per service, so nothing is counted twice.
+  Coralogix after a production deploy. It is the only deploy source per service, so nothing is
+  counted twice. Two modes: pass deploy-matrix (a JSON array of deploy entries, one record per
+  entry in the listed environments), or pass service, project-path and environment for one deploy.
 inputs:
-  service:        { description: "Service name, same as the Datadog service tag and OTEL_SERVICE_NAME", required: true }
-  team:           { description: "Owning team, same as the Datadog Software Catalog team (for example dd-advertiser_backend)", required: true }
-  project-path:   { description: "Monorepo folder of this service (for example services/aura-api)", required: true }
-  environment:    { description: "Deploy environment (prod, uat, ...)", required: true }
-  status:         { description: "job.status of the deploy job (success or failure)", required: true }
-  version:        { description: "Released version. Defaults to the short commit SHA", required: false, default: "" }
+  deploy-matrix:  { description: "JSON array of deploy entries (project, project_path, base_environment or environment, region, tag, git_ref, dd_team). One record per entry whose environment is listed in environments", required: false, default: "" }
+  environments:   { description: "Matrix mode: comma-separated environments to report (base environment names)", required: false, default: "prod" }
+  service:        { description: "Single mode: service name, same as the Datadog service tag and OTEL_SERVICE_NAME", required: false, default: "" }
+  team:           { description: "Single mode: owning team (for example dd-advertiser_backend). Optional", required: false, default: "" }
+  ref:            { description: "Single mode: git ref that was deployed (release tag, branch or SHA) when it is not the run's own commit. Empty = the run's commit", required: false, default: "" }
+  project-path:   { description: "Single mode: monorepo folder of this service (for example services/aura-api)", required: false, default: "" }
+  environment:    { description: "Single mode: deploy environment (prod, uat, ...)", required: false, default: "" }
+  region:         { description: "Single mode: region, when the service deploys separately per region. Each region keeps its own deploy history", required: false, default: "" }
+  version:        { description: "Single mode: released version. Defaults to the short commit SHA", required: false, default: "" }
+  status:         { description: "Result of the deploy (success or failure)", required: true }
   finished-at:    { description: "When the deploy ended (ISO 8601, UTC). Defaults to now", required: false, default: "" }
   rollback:       { description: "true when this run redeploys an older version on purpose", required: false, default: "false" }
   coralogix-logs-url: { description: "Coralogix REST logs endpoint for your region", required: false, default: "https://ingress.us2.coralogix.com/logs/v1/singles" }
@@ -23,14 +28,39 @@ runs:
     - shell: bash
       # Reporting never fails the pipeline: on any error it logs a warning and the deploy result stands.
       run: |
-        if ! bash "${{ github.action_path }}/report-deploy.sh"; then
-          echo "::warning::Deploy report to Coralogix failed. The deploy itself is not affected."
+        report() {
+          if ! bash "${{ github.action_path }}/report-deploy.sh"; then
+            echo "::warning::Deploy report to Coralogix failed for ${SERVICE:-?} ${DEPLOY_REGION:-}. The deploy itself is not affected."
+          fi
+        }
+        if [[ -z "$DEPLOY_MATRIX" ]]; then
+          report
+          exit 0
         fi
+        entries="$(jq -c --arg envs "$REPORT_ENVS" '($envs | split(",") | map(gsub("^ +| +$"; ""))) as $e
+          | (if type == "array" then . else [] end)[]
+          | select(((.base_environment // .environment // "") as $x | $e | index($x)) != null)' <<<"$DEPLOY_MATRIX" 2>/dev/null)" || {
+          echo "::warning::Deploy report: deploy-matrix is not valid JSON. Nothing reported."; exit 0; }
+        [[ -z "$entries" ]] && { echo "No ${REPORT_ENVS} deploys in this run: nothing to report."; exit 0; }
+        while IFS= read -r e; do
+          SERVICE="$(jq -r '.project // empty' <<<"$e")" \
+          PROJECT_PATH="$(jq -r '.project_path // empty' <<<"$e")" \
+          TEAM="$(jq -r '.dd_team // .team // empty' <<<"$e")" \
+          DEPLOY_ENV="$(jq -r '.base_environment // .environment // empty' <<<"$e")" \
+          DEPLOY_REGION="$(jq -r '.region // empty' <<<"$e")" \
+          VERSION="$(jq -r '.tag // empty' <<<"$e")" \
+          DEPLOY_REF="$(jq -r '.git_ref // empty' <<<"$e")" \
+          report
+        done <<<"$entries"
       env:
+        DEPLOY_MATRIX: ${{ inputs.deploy-matrix }}
+        REPORT_ENVS: ${{ inputs.environments }}
         SERVICE: ${{ inputs.service }}
         TEAM: ${{ inputs.team }}
+        DEPLOY_REF: ${{ inputs.ref }}
         PROJECT_PATH: ${{ inputs.project-path }}
         DEPLOY_ENV: ${{ inputs.environment }}
+        DEPLOY_REGION: ${{ inputs.region }}
         DEPLOY_STATUS: ${{ inputs.status }}
         VERSION: ${{ inputs.version }}
         DEPLOY_FINISHED_AT: ${{ inputs.finished-at }}

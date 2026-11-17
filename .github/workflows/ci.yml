@@ -1,0 +1,18 @@
+# Lab stand-in for PR CI: runs the cell against prod in plan-only mode (caller cdlx-ci). Must never be reported.
+name: CI
+run-name: "CI: PR #${{ github.event.pull_request.number }}"
+on:
+  pull_request:
+    paths: ["services/**", "apps/**"]
+permissions:
+  contents: read
+jobs:
+  deploy-prod-plan:
+    name: deploy - aura-api[k8s] (prod, us-east-1)
+    permissions: { contents: write, pull-requests: read, actions: read }
+    uses: ./.github/workflows/cell.yml
+    with:
+      deploy_matrix: '[{"project":"aura-api","project_path":"services/aura-api","project_type":"k8s","environment":"prod","base_environment":"prod","region":"us-east-1","approval_environment":"prod","tag":"0.0.0-pr","git_ref":"","dd_team":"dd-advertiser_backend"}]'
+      environment: prod
+      caller: cdlx-ci
+    secrets: inherit

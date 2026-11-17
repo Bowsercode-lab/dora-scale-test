@@ -1,0 +1,50 @@
+# Lab stand-in for a release: tag <project>@v<version> on the current commit, then deploy that tag to every prod region.
+name: Release
+run-name: "Release ${{ inputs.project }}"
+on:
+  workflow_dispatch:
+    inputs:
+      project: { description: "Project path (services/aura-api or apps/ads-manager-ui)", required: true, default: "services/aura-api" }
+      version: { description: "Release version, e.g. 1.2.0", required: true }
+      regions: { description: "Comma-separated regions", required: false, default: "us-east-1,eu-west-1" }
+permissions:
+  contents: read
+jobs:
+  tag:
+    name: NX Release (tag)
+    runs-on: ubuntu-latest
+    permissions: { contents: write }
+    outputs:
+      prod_matrix: ${{ steps.m.outputs.prod_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: m
+        env: { P: "${{ inputs.project }}", V: "${{ inputs.version }}", R: "${{ inputs.regions }}" }
+        run: |
+          name="$(basename "$P")"; tag="${name}@v${V}"
+          if ! git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null; then
+            git tag "$tag" && git push origin "refs/tags/${tag}"
+          fi
+          type=k8s; team=dd-advertiser_backend; [[ "$P" == apps/* ]] && { type=sam; team=dd-ads_manager; }
+          jq -cn --arg n "$name" --arg p "$P" --arg t "$type" --arg team "$team" --arg v "$V" --arg g "$tag" --arg R "$R" \
+            '[$R | split(",")[] | {name: ("deploy - " + $n + "[" + $t + "] (prod, " + . + ")"), project: $n, project_path: $p, project_type: $t,
+              environment: "prod", base_environment: "prod", region: ., approval_environment: "prod", tag: $v, git_ref: $g, dd_team: $team}]' \
+            | sed 's/^/prod_matrix=/' >> "$GITHUB_OUTPUT"
+
+  deploy-prod:
+    name: ${{ matrix.name }}
+    needs: [tag]
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.tag.outputs.prod_matrix) }}
+    concurrency:
+      group: main-${{ matrix.project }}-${{ matrix.environment }}-${{ matrix.region }}
+      cancel-in-progress: false
+    permissions: { contents: write, pull-requests: read, actions: read }
+    uses: ./.github/workflows/cell.yml
+    with:
+      deploy_matrix: ${{ toJson(fromJson(format('[{0}]', toJson(matrix)))) }}
+      environment: prod
+      caller: release
+    secrets: inherit

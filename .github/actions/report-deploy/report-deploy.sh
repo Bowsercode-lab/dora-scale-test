@@ -4,6 +4,7 @@
 #
 # Required env:
 #   SERVICE, TEAM, PROJECT_PATH, DEPLOY_ENV, DEPLOY_STATUS (success|failure)
+#   DEPLOY_REGION (optional): set when a service deploys separately per region; each region keeps its own history
 #   GITHUB_REPOSITORY, GITHUB_SHA, GITHUB_RUN_ID, GITHUB_SERVER_URL, GH_TOKEN (contents:write)
 #   CX_LOGS_URL      e.g. https://ingress.us2.coralogix.com/logs/v1/singles
 #   CX_API_KEY       Coralogix Send-Your-Data API key
@@ -15,17 +16,27 @@
 #   CX_SUBSYSTEM (default deployments), DRY_RUN=1 (print records, send nothing, move no tag)
 set -euo pipefail
 
-: "${SERVICE:?}" "${TEAM:?}" "${PROJECT_PATH:?}" "${DEPLOY_ENV:?}" "${DEPLOY_STATUS:?}"
+: "${SERVICE:?}" "${PROJECT_PATH:?}" "${DEPLOY_ENV:?}" "${DEPLOY_STATUS:?}"
 : "${GITHUB_REPOSITORY:?}" "${GITHUB_SHA:?}"
 API="${GITHUB_API_URL:-https://api.github.com}"
 REPO="$GITHUB_REPOSITORY"
+TEAM="${TEAM:-}"
+# The deployed commit: DEPLOY_REF (a release tag such as svc@v1.2.3, a branch or a SHA) when the deploy
+# checked out something other than the run's own commit; otherwise the run's commit.
 SHA="$GITHUB_SHA"
+if [[ -n "${DEPLOY_REF:-}" ]]; then
+  ref_enc="$(jq -rn --arg r "$DEPLOY_REF" '$r | @uri')"
+  SHA="$(curl -fsSL -H "Accept: application/vnd.github+json" ${GH_TOKEN:+-H "Authorization: Bearer ${GH_TOKEN}"} \
+        "${GITHUB_API_URL:-https://api.github.com}/repos/${GITHUB_REPOSITORY}/commits/${ref_enc}" | jq -r '.sha // empty')"
+  if [[ -z "$SHA" ]]; then echo "Deployed ref ${DEPLOY_REF} not found; nothing reported." >&2; exit 1; fi
+fi
 VERSION="${VERSION:-${SHA:0:12}}"
 APP="${CX_APPLICATION:-cicd}"
 SUB="${CX_SUBSYSTEM:-deployments}"
 ROLLBACK="${ROLLBACK:-false}"
 NOW="${DEPLOY_FINISHED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"   # deploy end; the deploy job passes it when the report runs as a later job
-TAG="deploy/${DEPLOY_ENV}/${SERVICE}"
+REGION="${DEPLOY_REGION:-}"
+TAG="deploy/${DEPLOY_ENV}/${REGION:+${REGION}/}${SERVICE}"
 RUN_URL="${GITHUB_SERVER_URL:-https://github.com}/${REPO}/actions/runs/${GITHUB_RUN_ID:-0}"
 
 gh_api() {  # gh_api PATH [extra curl args]
@@ -173,13 +184,13 @@ fi
 LEAD_FROM="$(jq -r '[.[].first_commit_at | select(. != null and . != "")] | min // empty' <<<"$CHANGES")"
 [[ -z "$LEAD_FROM" ]] && LEAD_FROM="$(gh_api "/repos/${REPO}/commits/${SHA}" | jq -r '.commit.author.date // empty' || true)"
 
-DEPLOY="$(jq -n --arg service "$SERVICE" --arg team "$TEAM" --arg project_path "$PROJECT_PATH" --arg env "$DEPLOY_ENV" \
+DEPLOY="$(jq -n --arg service "$SERVICE" --arg team "$TEAM" --arg project_path "$PROJECT_PATH" --arg env "$DEPLOY_ENV" --arg region "$REGION" \
   --arg lead_from "$LEAD_FROM" \
   --arg version "$VERSION" --arg sha "$SHA" --arg repo "$REPO" --arg run_url "$RUN_URL" --arg outcome "$DEPLOY_STATUS" \
   --arg started_at "$DEPLOY_STARTED_AT" --arg finished_at "$NOW" --arg previous_sha "$PREV_SHA" --arg compare "$COMPARE_STATUS" \
   --argjson rollback "$ROLLBACK" --argjson revert "$REVERT" --argjson hotfix "$HOTFIX" --argjson remediation "$REMEDIATION" \
   --argjson recovery_seconds "$RECOVERY_SECONDS" --argjson truncated "$TRUNCATED" --slurpfile commits <(printf '%s' "$COMMITS") --slurpfile changes <(printf '%s' "$CHANGES") \
-  '{dora: {event_type: "deployment", service: $service, team: $team, project_path: $project_path, env: $env,
+  '{dora: {event_type: "deployment", service: $service, team: $team, project_path: $project_path, env: $env, region: (if $region == "" then null else $region end),
            version: $version, sha: $sha, repo: $repo, run_url: $run_url, outcome: $outcome,
            started_at: $started_at, finished_at: $finished_at, previous_sha: $previous_sha, compare: $compare,
            batch_size: ($commits[0] | length), pr_count: ($changes[0] | length),
@@ -197,7 +208,7 @@ DEPLOY="$(jq -n --arg service "$SERVICE" --arg team "$TEAM" --arg project_path "
 # Change records (lead time) only for a successful deploy: a failed deploy shipped nothing.
 [[ "$DEPLOY_STATUS" == success ]] || CHANGES="[]"
 RECORDS="$(jq -c --argjson d "$DEPLOY" --slurpfile changes <(printf '%s' "$CHANGES") -n '
-  [$d] + [ $changes[0][] | {dora: ({event_type: "change"} + ($d.dora | {service, team, project_path, env, version, sha, repo, run_url, outcome}) + .)} ]')"
+  [$d] + [ $changes[0][] | {dora: ({event_type: "change"} + ($d.dora | {service, team, project_path, env, region, version, sha, repo, run_url, outcome}) + .)} ]')"
 
 send() {  # Coralogix REST singles: an array of {applicationName, subsystemName, severity, text}
   jq -c --arg app "$APP" --arg sub "$SUB" '[.[] | {applicationName: $app, subsystemName: $sub, severity: 3, text: (. | tojson)}]' <<<"$RECORDS"
