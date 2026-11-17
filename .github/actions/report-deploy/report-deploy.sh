@@ -111,7 +111,7 @@ COMMITS="$(jq -c 'map(del(.cdate))' <<<"$COMMITS")"
 [[ "$COMPARE_STATUS" == "behind" ]] && ROLLBACK=true
 
 # A re-run of this same run that already reported (the tag names this run and this commit is live) is not a new deployment.
-if [[ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 && -n "${GITHUB_RUN_ID:-}" && "$PREV_RUN_ID" == "$GITHUB_RUN_ID" && "$RUNNING_SHA" == "$SHA" ]]; then
+if [[ "$DEPLOY_STATUS" == success && "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 && -n "${GITHUB_RUN_ID:-}" && "$PREV_RUN_ID" == "$GITHUB_RUN_ID" && "$RUNNING_SHA" == "$SHA" ]]; then
   echo "Re-run of an already reported deploy of ${SERVICE} ${VERSION}: nothing sent."
   exit 0
 fi
@@ -158,8 +158,13 @@ done
 # 4. Remediation: a rollback, a revert PR or a hotfix-labelled PR marks the PREVIOUS deploy as a failed change.
 REMEDIATION=false; RECOVERY_SECONDS=null
 if [[ "$ROLLBACK" == true || "$REVERT" == true || "$HOTFIX" == true ]]; then
-  REMEDIATION=true
-  [[ -n "$PREV_FINISHED_AT" ]] && RECOVERY_SECONDS="$(secs_between "$PREV_FINISHED_AT" "$NOW")"
+  if [[ "$RUNNING_SHA" != "$PREV_SHA" ]]; then
+    # Already rolled back from the previous deploy: that failed change was counted once, at the first rollback.
+    echo "Previous deploy ${PREV_SHA:0:12} was already rolled back; not counted as a second failed change."
+  else
+    REMEDIATION=true
+    [[ -n "$PREV_FINISHED_AT" ]] && RECOVERY_SECONDS="$(secs_between "$PREV_FINISHED_AT" "$NOW")"
+  fi
 fi
 
 # The Coralogix "Dora Metrics" extension reads GitHub workflow_run-shaped fields under $d.github and counts every
@@ -189,6 +194,8 @@ DEPLOY="$(jq -n --arg service "$SERVICE" --arg team "$TEAM" --arg project_path "
                            name: $service, html_url: $run_url, head_sha: $sha}}}')"
 
 # One change record per PR so lead time and its stage breakdown are plain per-row fields.
+# Change records (lead time) only for a successful deploy: a failed deploy shipped nothing.
+[[ "$DEPLOY_STATUS" == success ]] || CHANGES="[]"
 RECORDS="$(jq -c --argjson d "$DEPLOY" --slurpfile changes <(printf '%s' "$CHANGES") -n '
   [$d] + [ $changes[0][] | {dora: ({event_type: "change"} + ($d.dora | {service, team, project_path, env, version, sha, repo, run_url, outcome}) + .)} ]')"
 
