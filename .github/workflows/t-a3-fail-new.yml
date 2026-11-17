@@ -1,0 +1,12 @@
+name: t-a3-fail-new
+on: workflow_dispatch
+jobs:
+  deploy:
+    permissions: { contents: write, pull-requests: read, actions: read }
+    uses: ./.github/workflows/_deploy-t-fail-new.yml
+    with:
+      service: aura-api-a3
+      team: dd-advertiser_backend
+      project-path: services/aura-api
+      environment: prod
+    secrets: inherit

@@ -1,0 +1,17 @@
+name: t-approval-watch
+on:
+  workflow_dispatch:
+permissions:
+  contents: read   # checkout of a private repository
+  actions: read
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash ./.github/actions/approval-watch/approval-watch.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: "1"
+          CX_LOGS_URL: https://ingress.us2.coralogix.com/logs/v1/singles
+          CX_API_KEY: ${{ secrets.CORALOGIX_SEND_YOUR_DATA_KEY }}
