@@ -3,7 +3,7 @@ on: workflow_dispatch
 jobs:
   deploy:
     permissions: { contents: write, pull-requests: read, actions: read }
-    uses: ./.github/workflows/_deploy-t-shipped.yml
+    uses: ./.github/workflows/_deploy.yml
     with:
       service: aura-api-gate
       team: dd-advertiser_backend

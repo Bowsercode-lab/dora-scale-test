@@ -9,7 +9,7 @@ on:
       environment:  { type: string, required: true }
       rollback:     { type: boolean, required: false, default: false }
     secrets:
-      CORALOGIX_SEND_YOUR_DATA_KEY: { required: true }
+      CORALOGIX_SEND_YOUR_DATA_KEY: { required: false }   # a missing key must not block the deploy
       CORALOGIX_OPS_EVENTS_KEY: { required: false }
 permissions:
   contents: read

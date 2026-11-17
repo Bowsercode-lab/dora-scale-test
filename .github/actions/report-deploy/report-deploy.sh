@@ -43,19 +43,22 @@ fi
 DEPLOY_STARTED_AT="${DEPLOY_STARTED_AT:-$NOW}"
 
 # 1. Previous successful deploy of this service to this env = the annotated tag deploy/<env>/<service>.
-PREV_SHA=""; PREV_FINISHED_AT=""
+PREV_SHA=""; PREV_FINISHED_AT=""; PREV_RUN_ID=""; RUNNING_SHA=""
 if ref_json="$(gh_api "/repos/${REPO}/git/ref/tags/${TAG}" 2>/dev/null)"; then
   obj_type="$(jq -r '.object.type' <<<"$ref_json")"; obj_sha="$(jq -r '.object.sha' <<<"$ref_json")"
   if [[ "$obj_type" == "tag" ]]; then
     tag_json="$(gh_api "/repos/${REPO}/git/tags/${obj_sha}")"
     PREV_SHA="$(jq -r '.object.sha' <<<"$tag_json")"
     PREV_FINISHED_AT="$(jq -r '.message | fromjson? | .finished_at // empty' <<<"$tag_json")"
+    PREV_RUN_ID="$(jq -r '.message | fromjson? | .run_id // empty' <<<"$tag_json")"
+    RUNNING_SHA="$(jq -r '.message | fromjson? | .running_sha // empty' <<<"$tag_json")"
   else
     PREV_SHA="$obj_sha"
   fi
 fi
 # Seeding or testing: PREVIOUS_SHA overrides the tag lookup (for example, the commit Datadog last saw deployed).
 PREV_SHA="${PREVIOUS_SHA:-$PREV_SHA}"
+RUNNING_SHA="${RUNNING_SHA:-$PREV_SHA}"   # what is live now: differs from PREV_SHA only after a rollback
 
 # 2. Commits in this deploy (previous deploy..this SHA). First deploy of a service = head commit only.
 # GitHub returns at most 250 commits per comparison unless it is paged, so both lists below are paged.
@@ -72,7 +75,7 @@ if [[ -n "$PREV_SHA" && "$PREV_SHA" != "$SHA" ]]; then
   while (( $(jq 'length' <<<"$COMMITS") < TOTAL && $(jq 'length' <<<"$COMMITS") < MAX_COMMITS )); do
     more="$(gh_api "/repos/${REPO}/compare/${PREV_SHA}...${SHA}?per_page=100&page=${page}" | jq -c "[.commits[] | ${COMMIT_FIELDS}]")"
     [[ "$(jq 'length' <<<"$more")" == 0 ]] && break
-    COMMITS="$(jq -c --argjson more "$more" '. + $more'   # pages do not overlap; keep oldest-first order <<<"$COMMITS")"
+    COMMITS="$(jq -c --argjson more "$more" '. + $more' <<<"$COMMITS")"   # pages do not overlap; keep oldest-first order
     page=$((page + 1))
   done
   if (( $(jq 'length' <<<"$COMMITS") < TOTAL )); then
@@ -91,20 +94,24 @@ if [[ -n "${PROJECT_PATH:-}" && "$COMPARE_STATUS" =~ ^(ahead|diverged)$ && "$(jq
   SINCE="$(jq -r '[.[].cdate] | min' <<<"$COMMITS")"
   PATH_SHAS="[]"; page=1
   while (( $(jq 'length' <<<"$PATH_SHAS") < MAX_COMMITS )); do
-    batch="$(gh_api "/repos/${REPO}/commits?sha=${SHA}&path=${PROJECT_PATH}&since=${SINCE}&per_page=100&page=${page}")"
+    batch="$(gh_api "/repos/${REPO}/commits?sha=${SHA}&path=${PROJECT_PATH}&since=${SINCE}&per_page=100&page=${page}" | jq -c '[.[] | {sha, parents: [.parents[].sha]}]')"
     [[ "$(jq 'length' <<<"$batch")" == 0 ]] && break
     PATH_SHAS="$(jq -c --argjson b "$batch" '. + [$b[] | select((.parents | length) == 1) | .sha]' <<<"$PATH_SHAS")"   # authored commits, not merge commits
     [[ "$(jq 'length' <<<"$batch")" -lt 100 ]] && break
     page=$((page + 1))
   done
-  COMMITS="$(jq -c --argjson keep "$PATH_SHAS" '[.[] | select(.sha as $s | $keep | index($s))]' <<<"$COMMITS")"
+  if (( $(jq 'length' <<<"$PATH_SHAS") >= MAX_COMMITS )); then
+    TRUNCATED=true
+    echo "::warning::Folder history for ${PROJECT_PATH} exceeds ${MAX_COMMITS} commits; batch size may be low."
+  fi
+  COMMITS="$(jq -c --slurpfile keep <(printf '%s' "$PATH_SHAS") '[.[] | select(.sha as $s | $keep[0] | index($s))]' <<<"$COMMITS")"
 fi
 COMMITS="$(jq -c 'map(del(.cdate))' <<<"$COMMITS")"
 # A deploy of an older commit than the last one is a rollback even if nobody said so.
 [[ "$COMPARE_STATUS" == "behind" ]] && ROLLBACK=true
 
-# A re-run of a deploy that already reported (same commit, later attempt) is not a new deployment.
-if [[ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 && "$COMPARE_STATUS" == "identical" && "$ROLLBACK" != true ]]; then
+# A re-run of this same run that already reported (the tag names this run and this commit is live) is not a new deployment.
+if [[ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 && -n "${GITHUB_RUN_ID:-}" && "$PREV_RUN_ID" == "$GITHUB_RUN_ID" && "$RUNNING_SHA" == "$SHA" ]]; then
   echo "Re-run of an already reported deploy of ${SERVICE} ${VERSION}: nothing sent."
   exit 0
 fi
@@ -166,12 +173,12 @@ DEPLOY="$(jq -n --arg service "$SERVICE" --arg team "$TEAM" --arg project_path "
   --arg version "$VERSION" --arg sha "$SHA" --arg repo "$REPO" --arg run_url "$RUN_URL" --arg outcome "$DEPLOY_STATUS" \
   --arg started_at "$DEPLOY_STARTED_AT" --arg finished_at "$NOW" --arg previous_sha "$PREV_SHA" --arg compare "$COMPARE_STATUS" \
   --argjson rollback "$ROLLBACK" --argjson revert "$REVERT" --argjson hotfix "$HOTFIX" --argjson remediation "$REMEDIATION" \
-  --argjson recovery_seconds "$RECOVERY_SECONDS" --argjson truncated "$TRUNCATED" --argjson commits "$COMMITS" --argjson changes "$CHANGES" \
+  --argjson recovery_seconds "$RECOVERY_SECONDS" --argjson truncated "$TRUNCATED" --slurpfile commits <(printf '%s' "$COMMITS") --slurpfile changes <(printf '%s' "$CHANGES") \
   '{dora: {event_type: "deployment", service: $service, team: $team, project_path: $project_path, env: $env,
            version: $version, sha: $sha, repo: $repo, run_url: $run_url, outcome: $outcome,
            started_at: $started_at, finished_at: $finished_at, previous_sha: $previous_sha, compare: $compare,
-           batch_size: ($commits | length), pr_count: ($changes | length),
-           ai_assisted_commits: ([$commits[] | select(.ai_trailer)] | length),
+           batch_size: ($commits[0] | length), pr_count: ($changes[0] | length),
+           ai_assisted_commits: ([$commits[0][] | select(.ai_trailer)] | length),
            rollback: $rollback, revert: $revert, hotfix: $hotfix,
            remediation: $remediation, remediates_sha: (if $remediation then $previous_sha else null end),
            recovery_seconds: $recovery_seconds, truncated: $truncated},
@@ -182,8 +189,8 @@ DEPLOY="$(jq -n --arg service "$SERVICE" --arg team "$TEAM" --arg project_path "
                            name: $service, html_url: $run_url, head_sha: $sha}}}')"
 
 # One change record per PR so lead time and its stage breakdown are plain per-row fields.
-RECORDS="$(jq -c --argjson d "$DEPLOY" --argjson changes "$CHANGES" -n '
-  [$d] + [ $changes[] | {dora: ({event_type: "change"} + ($d.dora | {service, team, project_path, env, version, sha, repo, run_url, outcome}) + .)} ]')"
+RECORDS="$(jq -c --argjson d "$DEPLOY" --slurpfile changes <(printf '%s' "$CHANGES") -n '
+  [$d] + [ $changes[0][] | {dora: ({event_type: "change"} + ($d.dora | {service, team, project_path, env, version, sha, repo, run_url, outcome}) + .)} ]')"
 
 send() {  # Coralogix REST singles: an array of {applicationName, subsystemName, severity, text}
   jq -c --arg app "$APP" --arg sub "$SUB" '[.[] | {applicationName: $app, subsystemName: $sub, severity: 3, text: (. | tojson)}]' <<<"$RECORDS"
@@ -214,16 +221,29 @@ if [[ -n "${CX_OPS_EVENTS_URL:-}" && -n "${CX_OPS_EVENTS_KEY:-}" ]]; then
   && echo "Sent APM deployment marker." || echo "::warning::APM deployment marker not sent (check the OpsEvents key)."
 fi
 
-# The tag marks the newest commit deployed. A rollback (older commit) leaves it in place, so the next
-# forward deploy does not count the rolled-back pull requests a second time.
-if [[ "$DEPLOY_STATUS" == success && "$COMPARE_STATUS" == behind ]]; then
-  echo "Rollback: deploy tag ${TAG} stays on ${PREV_SHA:0:12}."
-elif [[ "$DEPLOY_STATUS" == success ]]; then
-  tag_obj="$(gh_api "/repos/${REPO}/git/tags" -X POST -d "$(jq -n --arg tag "$TAG" --arg sha "$SHA" --arg fin "$NOW" --arg v "$VERSION" \
-      '{tag: $tag, object: $sha, type: "commit", message: ({finished_at: $fin, version: $v} | tojson)}')" | jq -r '.sha')"
+# The tag sits on the newest commit deployed and records what is live (running_sha) and which run reported it.
+# A rollback (older commit) keeps the tag on the newer commit, so the next forward deploy does not count the
+# rolled-back pull requests again, and only updates running_sha and run_id.
+write_tag() {  # write_tag TARGET_SHA RUNNING_SHA FINISHED_AT
+  local body tag_obj
+  body="$(jq -n --arg tag "$TAG" --arg sha "$1" --arg running "$2" --arg fin "$3" --arg v "$VERSION" --arg run "${GITHUB_RUN_ID:-}" \
+      '{tag: $tag, object: $sha, type: "commit", message: ({finished_at: $fin, version: $v, run_id: $run, running_sha: $running} | tojson)}')" || return 1
+  tag_obj="$(gh_api "/repos/${REPO}/git/tags" -X POST -d "$body" | jq -r '.sha')" || return 1
+  [[ -n "$tag_obj" && "$tag_obj" != null ]] || return 1
   if gh_api "/repos/${REPO}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
-    gh_api "/repos/${REPO}/git/refs/tags/${TAG}" -X PATCH -d "{\"sha\":\"${tag_obj}\",\"force\":true}" >/dev/null
+    gh_api "/repos/${REPO}/git/refs/tags/${TAG}" -X PATCH -d "{\"sha\":\"${tag_obj}\",\"force\":true}" >/dev/null || return 1
   else
-    gh_api "/repos/${REPO}/git/refs" -X POST -d "{\"ref\":\"refs/tags/${TAG}\",\"sha\":\"${tag_obj}\"}" >/dev/null
+    gh_api "/repos/${REPO}/git/refs" -X POST -d "{\"ref\":\"refs/tags/${TAG}\",\"sha\":\"${tag_obj}\"}" >/dev/null || return 1
+  fi
+}
+if [[ "$DEPLOY_STATUS" == success ]]; then
+  if [[ "$COMPARE_STATUS" == behind ]]; then
+    tag_args=("$PREV_SHA" "$SHA" "${PREV_FINISHED_AT:-$NOW}")
+    echo "Rollback: deploy tag ${TAG} stays on ${PREV_SHA:0:12}; ${SHA:0:12} recorded as live."
+  else
+    tag_args=("$SHA" "$SHA" "$NOW")
+  fi
+  if ! write_tag "${tag_args[@]}"; then
+    echo "::error::Deploy was reported, but tag ${TAG} could not be updated. The next deploy of ${SERVICE} will count these pull requests again. Check tag rules for deploy/* and the report job permissions."
   fi
 fi
