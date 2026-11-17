@@ -1,0 +1,47 @@
+{
+ "alertDefProperties": {
+  "name": "DORA lab: deploy waiting on approval > 1h",
+  "description": "Fires while a deployment is still waiting at a GitHub environment approval gate. Lab threshold 1 hour; production threshold comes from the customer (Q8, e.g. 24 hours).",
+  "priority": "ALERT_DEF_PRIORITY_P4",
+  "type": "ALERT_DEF_TYPE_LOGS_THRESHOLD",
+  "enabled": true,
+  "groupByKeys": [
+   "dora.workflow"
+  ],
+  "logsThreshold": {
+   "logsFilter": {
+    "simpleFilter": {
+     "luceneQuery": "dora.event_type:\"approval_pending\" AND dora.wait_hours:[1 TO *]",
+     "labelFilters": {
+      "applicationName": [
+       {
+        "operation": "LOG_FILTER_OPERATION_TYPE_IS_OR_UNSPECIFIED",
+        "value": "cicd"
+       }
+      ],
+      "subsystemName": [
+       {
+        "operation": "LOG_FILTER_OPERATION_TYPE_IS_OR_UNSPECIFIED",
+        "value": "approvals"
+       }
+      ]
+     }
+    }
+   },
+   "rules": [
+    {
+     "condition": {
+      "conditionType": "LOGS_THRESHOLD_CONDITION_TYPE_MORE_THAN_OR_UNSPECIFIED",
+      "threshold": 0,
+      "timeWindow": {
+       "logsTimeWindowSpecificValue": "LOGS_TIME_WINDOW_VALUE_HOUR_1"
+      }
+     },
+     "override": {
+      "priority": "ALERT_DEF_PRIORITY_P4"
+     }
+    }
+   ]
+  }
+ }
+}

@@ -1,0 +1,42 @@
+name: Report deployment to Coralogix
+description: >
+  Sends one DORA deployment record (and one change record per pull request in the deploy) to
+  Coralogix. Run it as the last step of every production deploy job. It is the only deploy
+  source per service, so nothing is counted twice.
+inputs:
+  service:        { description: "Service name, same as the Datadog service tag and OTEL_SERVICE_NAME", required: true }
+  team:           { description: "Owning team, same as the Datadog Software Catalog team (for example dd-advertiser_backend)", required: true }
+  project-path:   { description: "Monorepo folder of this service (for example services/aura-api)", required: true }
+  environment:    { description: "Deploy environment (prod, uat, ...)", required: true }
+  status:         { description: "job.status of the deploy job (success or failure)", required: true }
+  version:        { description: "Released version. Defaults to the short commit SHA", required: false, default: "" }
+  finished-at:    { description: "When the deploy ended (ISO 8601, UTC). Defaults to now", required: false, default: "" }
+  rollback:       { description: "true when this run redeploys an older version on purpose", required: false, default: "false" }
+  coralogix-logs-url: { description: "Coralogix REST logs endpoint for your region", required: false, default: "https://ingress.us2.coralogix.com/logs/v1/singles" }
+  coralogix-api-key:  { description: "Coralogix Send-Your-Data API key (from a secret)", required: true }
+  coralogix-ops-events-url: { description: "Coralogix ops-events endpoint for APM deployment markers", required: false, default: "https://ingress.us2.coralogix.com/v1/ops-events" }
+  coralogix-ops-events-key: { description: "Send-Your-Data key with the OpsEvents preset (optional; no APM marker without it)", required: false, default: "" }
+  github-token:   { description: "Token with contents:write and pull-requests:read (to read PRs and move the deploy tag)", required: true }
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      # Reporting never fails the pipeline: on any error it logs a warning and the deploy result stands.
+      run: |
+        if ! bash "${{ github.action_path }}/report-deploy.sh"; then
+          echo "::warning::Deploy report to Coralogix failed. The deploy itself is not affected."
+        fi
+      env:
+        SERVICE: ${{ inputs.service }}
+        TEAM: ${{ inputs.team }}
+        PROJECT_PATH: ${{ inputs.project-path }}
+        DEPLOY_ENV: ${{ inputs.environment }}
+        DEPLOY_STATUS: ${{ inputs.status }}
+        VERSION: ${{ inputs.version }}
+        DEPLOY_FINISHED_AT: ${{ inputs.finished-at }}
+        ROLLBACK: ${{ inputs.rollback }}
+        CX_LOGS_URL: ${{ inputs.coralogix-logs-url }}
+        CX_API_KEY: ${{ inputs.coralogix-api-key }}
+        CX_OPS_EVENTS_URL: ${{ inputs.coralogix-ops-events-url }}
+        CX_OPS_EVENTS_KEY: ${{ inputs.coralogix-ops-events-key }}
+        GH_TOKEN: ${{ inputs.github-token }}
