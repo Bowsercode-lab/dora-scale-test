@@ -1,0 +1,20 @@
+# Lab only: send a raw deploy_matrix through the cell to test matrix shapes (environment names, missing region, duplicates).
+name: Shapes
+run-name: "Shapes: ${{ inputs.label }}"
+on:
+  workflow_dispatch:
+    inputs:
+      label: { required: true }
+      deploy_matrix: { description: "Raw JSON array of entries", required: true }
+permissions:
+  contents: read
+jobs:
+  cell:
+    name: deploy - shapes
+    permissions: { contents: write, pull-requests: read, actions: read }
+    uses: ./.github/workflows/cell.yml
+    with:
+      deploy_matrix: ${{ inputs.deploy_matrix }}
+      environment: prod
+      caller: manual
+    secrets: inherit

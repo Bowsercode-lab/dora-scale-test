@@ -116,12 +116,13 @@ jobs:
     if: >-
       always() && needs.route.result == 'success' && needs.aggregate.result != 'skipped' &&
       (needs.gate.result == 'success' || needs.gate.result == 'skipped') &&
-      inputs.dry_run != true && inputs.destroy != true && inputs.caller != 'pr' && inputs.caller != 'cdlx-ci'
+      inputs.dry_run != true && inputs.destroy != true && inputs.destroy != 'true' &&
+      inputs.caller != 'pr' && inputs.caller != 'cdlx-ci'
     continue-on-error: true
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm   # stand-in for linux-arm-small
     permissions: { contents: write, pull-requests: read, actions: read }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { sparse-checkout: .github/actions/report-deploy }
       - uses: ./.github/actions/report-deploy
         with:

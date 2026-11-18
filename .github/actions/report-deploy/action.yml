@@ -37,10 +37,20 @@ runs:
           report
           exit 0
         fi
-        entries="$(jq -c --arg envs "$REPORT_ENVS" '($envs | split(",") | map(gsub("^ +| +$"; ""))) as $e
-          | (if type == "array" then . else [] end)[]
-          | select(((.base_environment // .environment // "") as $x | $e | index($x)) != null)' <<<"$DEPLOY_MATRIX" 2>/dev/null)" || {
+        # An entry matches a listed environment by its base or full environment name, exactly or with a
+        # suffix (prod matches prod, prod-eu, prod-use1; not preprod or publish-prod). It is reported under
+        # the listed name. Region falls back to that suffix. One record per project, environment and region.
+        tagged="$(jq -c --arg envs "$REPORT_ENVS" '($envs | split(",") | map(gsub("^ +| +$"; "")) | map(select(. != ""))) as $e
+          | [(if type == "array" then . else [] end)[]
+            | (.base_environment // .environment // "") as $b | (.environment // $b) as $f
+            | ([$e[] as $x | select($b == $x or $f == $x or ($b | startswith($x + "-")) or ($f | startswith($x + "-"))) | $x] | first) as $m
+            | . + {_env: $m, _region: (if (.region // "") != "" then .region
+                elif $m != null and ($f | startswith($m + "-")) then ($f | ltrimstr($m + "-"))
+                elif $m != null and ($b | startswith($m + "-")) then ($b | ltrimstr($m + "-")) else "" end)}]' <<<"$DEPLOY_MATRIX" 2>/dev/null)" || {
           echo "::warning::Deploy report: deploy-matrix is not valid JSON. Nothing reported."; exit 0; }
+        skipped="$(jq -r '[.[] | select(._env == null) | "\(.project // "?") (\(.environment // .base_environment // "no environment"))"] | join(", ")' <<<"$tagged")"
+        [[ -n "$skipped" ]] && echo "Not reported, environment not in \"${REPORT_ENVS}\": ${skipped}"
+        entries="$(jq -c '[.[] | select(._env != null)] | unique_by([.project, ._env, ._region])[]' <<<"$tagged")"
         [[ -z "$entries" ]] && { echo "No ${REPORT_ENVS} deploys in this run: nothing to report."; exit 0; }
         # One result covers the whole cell. With several entries and a failure, which entries failed is unknown,
         # so nothing is reported rather than marking successful deploys as failed.
@@ -52,8 +62,8 @@ runs:
           SERVICE="$(jq -r '.project // empty' <<<"$e")" \
           PROJECT_PATH="$(jq -r '.project_path // empty' <<<"$e")" \
           TEAM="$(jq -r '.dd_team // .team // empty' <<<"$e")" \
-          DEPLOY_ENV="$(jq -r '.base_environment // .environment // empty' <<<"$e")" \
-          DEPLOY_REGION="$(jq -r '.region // empty' <<<"$e")" \
+          DEPLOY_ENV="$(jq -r '._env' <<<"$e")" \
+          DEPLOY_REGION="$(jq -r '._region' <<<"$e")" \
           VERSION="$(jq -r '.tag // empty' <<<"$e")" \
           DEPLOY_REF="$(jq -r '.git_ref // empty' <<<"$e")" \
           report
