@@ -42,6 +42,12 @@ runs:
           | select(((.base_environment // .environment // "") as $x | $e | index($x)) != null)' <<<"$DEPLOY_MATRIX" 2>/dev/null)" || {
           echo "::warning::Deploy report: deploy-matrix is not valid JSON. Nothing reported."; exit 0; }
         [[ -z "$entries" ]] && { echo "No ${REPORT_ENVS} deploys in this run: nothing to report."; exit 0; }
+        # One result covers the whole cell. With several entries and a failure, which entries failed is unknown,
+        # so nothing is reported rather than marking successful deploys as failed.
+        if [[ "$(wc -l <<<"$entries")" -gt 1 && "$DEPLOY_STATUS" != success ]]; then
+          echo "::warning::Deploy report: ${DEPLOY_STATUS} result for a run with $(wc -l <<<"$entries" | tr -d ' ') deploys; which ones failed is unknown, so none were reported."
+          exit 0
+        fi
         while IFS= read -r e; do
           SERVICE="$(jq -r '.project // empty' <<<"$e")" \
           PROJECT_PATH="$(jq -r '.project_path // empty' <<<"$e")" \

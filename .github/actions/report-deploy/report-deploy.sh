@@ -27,7 +27,7 @@ SHA="$GITHUB_SHA"
 if [[ -n "${DEPLOY_REF:-}" ]]; then
   ref_enc="$(jq -rn --arg r "$DEPLOY_REF" '$r | @uri')"
   SHA="$(curl -fsSL -H "Accept: application/vnd.github+json" ${GH_TOKEN:+-H "Authorization: Bearer ${GH_TOKEN}"} \
-        "${GITHUB_API_URL:-https://api.github.com}/repos/${GITHUB_REPOSITORY}/commits/${ref_enc}" | jq -r '.sha // empty')"
+        "${GITHUB_API_URL:-https://api.github.com}/repos/${GITHUB_REPOSITORY}/commits/${ref_enc}" | jq -r '.sha // empty' || true)"
   if [[ -z "$SHA" ]]; then echo "Deployed ref ${DEPLOY_REF} not found; nothing reported." >&2; exit 1; fi
 fi
 VERSION="${VERSION:-${SHA:0:12}}"
@@ -168,7 +168,7 @@ done
 
 # 4. Remediation: a rollback, a revert PR or a hotfix-labelled PR marks the PREVIOUS deploy as a failed change.
 REMEDIATION=false; RECOVERY_SECONDS=null
-if [[ "$ROLLBACK" == true || "$REVERT" == true || "$HOTFIX" == true ]]; then
+if [[ "$DEPLOY_STATUS" == success && ( "$ROLLBACK" == true || "$REVERT" == true || "$HOTFIX" == true ) ]]; then
   if [[ "$RUNNING_SHA" != "$PREV_SHA" ]]; then
     # Already rolled back from the previous deploy: that failed change was counted once, at the first rollback.
     echo "Previous deploy ${PREV_SHA:0:12} was already rolled back; not counted as a second failed change."
